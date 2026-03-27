@@ -1,185 +1,90 @@
-"""
-Polymarket BTC 5m Pre-Market Dual Limit Bot
-============================================
-
-Strategy (5m only):
-  1. While the current 5m window is live, find the NEXT window's market
-     (Polymarket pre-creates ~24h ahead).
-  2. Place two limit BUY orders on the next window at ENTRY_PRICE (default $0.33):
-       - BUY UP  @ 0.33  for $bet_amount
-       - BUY DOWN @ 0.33  for $bet_amount
-  3. Poll every POLL_INTERVAL_SEC seconds once the next window goes live.
-     Whichever side fills first → cancel the other → place TP limit SELL at 0.99.
-  4. No stop loss — losing positions expire worthless at window close.
-
-Martingale on consecutive losses:
-  - Base bet = $BASE_BET_USD (default $1)
-  - Two consecutive losses → multiply current bet by 2x
-  - Any win resets bet back to $BASE_BET_USD
-  - Neither side fills (no fill) → not counted as a loss, bet unchanged
-
-Env vars:
-  PRIVATE_KEY        Wallet private key
-  FUNDER             Proxy wallet address
-  SIGNATURE_TYPE     0=EOA, 1=Magic/email, 2=browser (default 2)
-  BASE_BET_USD       Base order size in USD (default 1.0)
-  ENTRY_PRICE        Limit price for both UP and DOWN (default 0.33)
-  TAKE_PROFIT_PRICE  TP limit sell price (default 0.99)
-  POLL_INTERVAL_SEC  Fill-check polling interval in seconds (default 10)
-  DRY_RUN            "true" to simulate without placing real orders (default true)
-"""
-
 import os
 import json
 import time
 import asyncio
-import traceback
 import datetime
 import requests
-from dataclasses import dataclass
-from typing import Optional, Dict, Tuple, List
+from dataclasses import dataclass, field
+from typing import List, Dict, Optional
 
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs, OrderType
 from py_clob_client.order_builder.constants import BUY, SELL
 
-
 # ── Config ────────────────────────────────────────────────────────────────────
-
-BASE_BET_USD      = float(os.getenv("BASE_BET_USD", 1.0))
-ENTRY_PRICE       = float(os.getenv("ENTRY_PRICE", 0.33))
-TAKE_PROFIT_PRICE = float(os.getenv("TAKE_PROFIT_PRICE", 0.99))
-POLL_INTERVAL_SEC = int(os.getenv("POLL_INTERVAL_SEC", 10))
-SIGNATURE_TYPE    = int(os.getenv("SIGNATURE_TYPE", 2))
-DRY_RUN           = os.getenv("DRY_RUN", "true").lower() == "true"
+INITIAL_BET_PER_LEVEL = float(os.getenv("INITIAL_BET_PER_LEVEL", 2.0))
+FLIP_BET_USD          = float(os.getenv("FLIP_BET_USD", 6.0))
+ENTRY_PRICES          = [0.40, 0.30, 0.20]
+FLIP_PRICE            = float(os.getenv("FLIP_PRICE", 0.80))
+STOP_LOSS_PRICE       = float(os.getenv("STOP_LOSS_PRICE", 0.15))
+TAKE_PROFIT_PRICE     = float(os.getenv("TAKE_PROFIT_PRICE", 0.99))
+POLL_INTERVAL_SEC     = int(os.getenv("POLL_INTERVAL_SEC", 1))   # 1s for speed
 
 INTERVAL_SEC = 300   # 5 minutes
 SLUG_PREFIX  = "btc-updown-5m-"
 GAMMA_API    = "https://gamma-api.polymarket.com"
 CLOB_API     = "https://clob.polymarket.com"
 
+DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
 
-# ── State dataclasses ─────────────────────────────────────────────────────────
+# ── State ─────────────────────────────────────────────────────────────────────
 
 @dataclass
 class WindowState:
-    """Everything we need to track for one 5m window cycle."""
     slot_ts: int
     end_ts: int
-    yes_token_id: str        # UP token
-    no_token_id: str         # DOWN token
-    bet_amount: float
-    up_order_id: Optional[str] = None
-    down_order_id: Optional[str] = None
-    filled_side: Optional[str] = None   # "UP" or "DOWN"
-    filled_shares: float = 0.0
-    tp_order_id: Optional[str] = None
+    initial_side: str                    # "UP" or "DOWN"
+    initial_token_id: str
+    opposite_token_id: str
+    initial_order_ids: List[str] = field(default_factory=list)
+    flip_order_id: Optional[str] = None
+    flipped: bool = False
+    tp_orders: Dict[str, str] = field(default_factory=dict)  # token_id -> tp_order_id
     resolved: bool = False
-
-
-@dataclass
-class MartingaleTracker:
-    base_bet: float = BASE_BET_USD
-    current_bet: float = BASE_BET_USD
-    consecutive_losses: int = 0
-
-    def record_win(self):
-        print(f"[martingale] ✅ WIN — resetting bet from ${self.current_bet:.2f} → ${self.base_bet:.2f}")
-        self.consecutive_losses = 0
-        self.current_bet = self.base_bet
-
-    def record_loss(self):
-        self.consecutive_losses += 1
-        if self.consecutive_losses >= 2:
-            prev = self.current_bet
-            self.current_bet = self.current_bet * 2
-            print(f"[martingale] ❌ LOSS #{self.consecutive_losses} — doubling bet: ${prev:.2f} → ${self.current_bet:.2f}")
-        else:
-            print(f"[martingale] ❌ LOSS #1 — bet stays at ${self.current_bet:.2f} (need 2 consecutive to double)")
-
-    def record_no_fill(self):
-        print(f"[martingale] ⏸  NO FILL — bet unchanged at ${self.current_bet:.2f}")
-
-
-# ── Globals ───────────────────────────────────────────────────────────────────
-
-martingale = MartingaleTracker()
-current_window: Optional[WindowState] = None
 
 
 # ── Polymarket Client ─────────────────────────────────────────────────────────
 
 class PolymarketClient:
-
     def __init__(self):
         pk = os.getenv("PRIVATE_KEY")
         funder = os.getenv("FUNDER")
+        sig_type = int(os.getenv("SIGNATURE_TYPE", 2))
+
         if not pk or not funder:
             raise ValueError("PRIVATE_KEY and FUNDER env vars are required")
+
+        print(f"[client] Initializing | signature_type={sig_type} | funder={funder[:12]}... | DRY_RUN={DRY_RUN}")
+
         self.clob = ClobClient(
             host=CLOB_API,
             key=pk,
             chain_id=137,
             funder=funder,
-            signature_type=SIGNATURE_TYPE,
+            signature_type=sig_type,
         )
         self.clob.set_api_creds(self.clob.create_or_derive_api_creds())
-        print(f"[client] Connected | DRY_RUN={DRY_RUN} | "
-              f"base_bet=${BASE_BET_USD} | entry={ENTRY_PRICE} | TP={TAKE_PROFIT_PRICE}")
-
-    # ── Market discovery ──────────────────────────────────────────────────────
+        print("[client] ✅ Connected and API creds set")
 
     @staticmethod
-    def _parse_token_ids(market: Dict) -> Tuple[Optional[str], Optional[str]]:
-        """
-        clobTokenIds is returned as a JSON-encoded string by the Gamma API:
-          e.g. "[\"token_up\", \"token_down\"]"
-        index 0 = YES/UP,  index 1 = NO/DOWN
-        """
+    def _parse_token_ids(market: Dict) -> tuple:
         clob = market.get("clobTokenIds")
         if isinstance(clob, str):
             try:
                 clob = json.loads(clob)
-            except Exception:
+            except:
                 clob = None
         if isinstance(clob, list) and len(clob) >= 2:
             return str(clob[0]), str(clob[1])
-        # Fallback: tokens list
-        yes_id = no_id = None
-        for t in market.get("tokens", []):
-            tid = str(t.get("token_id") or t.get("clobTokenId") or "")
-            outcome = str(t.get("outcome", "")).lower()
-            if outcome in ["yes", "up", "1"]:
-                yes_id = tid
-            elif outcome in ["no", "down", "0"]:
-                no_id = tid
-        return yes_id, no_id
-
-    @staticmethod
-    def _end_ts_from_market(market_obj: Dict, event_obj: Dict, slot_ts: int) -> int:
-        """Parse end timestamp from market or event endDate, fallback to slot_ts + interval."""
-        raw = market_obj.get("endDate") or event_obj.get("endDate")
-        if raw:
-            try:
-                d = datetime.datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
-                return int(d.timestamp())
-            except Exception:
-                pass
-        return slot_ts + INTERVAL_SEC
+        return None, None
 
     def fetch_market_for_slot(self, slot_ts: int) -> Optional[Dict]:
-        """
-        GET /events?slug=btc-updown-5m-{slot_ts}
-        Returns dict with yes_token_id, no_token_id, slot_ts, end_ts, question.
-        """
         slug = f"{SLUG_PREFIX}{slot_ts}"
         try:
             r = requests.get(f"{GAMMA_API}/events", params={"slug": slug}, timeout=8)
             if r.status_code != 200:
                 return None
             data = r.json()
-            if not data:
-                return None
             events = data if isinstance(data, list) else [data]
             for event in events:
                 if event.get("slug") != slug:
@@ -187,377 +92,286 @@ class PolymarketClient:
                 for m in event.get("markets", []):
                     yes_t, no_t = self._parse_token_ids(m)
                     if yes_t and no_t:
-                        end_ts = self._end_ts_from_market(m, event, slot_ts)
                         return {
                             "yes_token_id": yes_t,
-                            "no_token_id":  no_t,
-                            "slot_ts":      slot_ts,
-                            "end_ts":       end_ts,
-                            "question":     m.get("question") or event.get("title", ""),
+                            "no_token_id": no_t,
+                            "slot_ts": slot_ts,
+                            "end_ts": slot_ts + INTERVAL_SEC,
+                            "question": m.get("question", ""),
                         }
         except Exception as e:
-            print(f"[fetch_market] Error for {slug}: {e}")
+            print(f"[fetch_market] Error: {e}")
         return None
 
     def find_next_window_market(self) -> Optional[Dict]:
-        """
-        Find the market for the NEXT 5m window (current + 1 interval).
-        Pre-market orders are placed here while the current window is still live.
-        """
-        now        = int(time.time())
+        now = int(time.time())
         current_ts = (now // INTERVAL_SEC) * INTERVAL_SEC
-        next_ts    = current_ts + INTERVAL_SEC
-        dt_str     = datetime.datetime.fromtimestamp(next_ts, tz=datetime.timezone.utc).strftime("%H:%M UTC")
+        next_ts = current_ts + INTERVAL_SEC
 
-        print(f"[find_next] Searching next window: slot_ts={next_ts} ({dt_str})")
-
-        # Stage 1: direct slug lookups for next and +2 windows
         for ts in [next_ts, next_ts + INTERVAL_SEC]:
             m = self.fetch_market_for_slot(ts)
             if m:
-                print(f"[find_next] ✅ Found via slug: {m['question'][:100]}")
+                print(f"[find_next] ✅ Found market for slot {ts}")
                 return m
 
-        # Stage 2: scan active events, find the soonest future window
-        print(f"[find_next] Slug lookup missed — scanning active events ...")
+        # Fallback scan
         try:
-            r = requests.get(
-                f"{GAMMA_API}/events",
-                params={"active": "true", "closed": "false", "limit": 50},
-                timeout=15,
-            )
+            r = requests.get(f"{GAMMA_API}/events", params={"active": "true", "closed": "false", "limit": 50}, timeout=15)
             if r.status_code == 200:
-                candidates: List[Tuple[int, Dict]] = []
+                candidates = []
                 for event in r.json():
                     slug = event.get("slug", "")
                     if not slug.startswith(SLUG_PREFIX):
                         continue
                     try:
                         ts = int(slug.rsplit("-", 1)[-1])
-                    except ValueError:
+                    except:
                         continue
-                    if ts <= now:   # skip current and past windows
+                    if ts <= now:
                         continue
                     for m in event.get("markets", []):
                         yes_t, no_t = self._parse_token_ids(m)
                         if yes_t and no_t:
-                            end_ts = self._end_ts_from_market(m, event, ts)
                             candidates.append((ts, {
                                 "yes_token_id": yes_t,
-                                "no_token_id":  no_t,
-                                "slot_ts":      ts,
-                                "end_ts":       end_ts,
-                                "question":     m.get("question") or event.get("title", ""),
+                                "no_token_id": no_t,
+                                "slot_ts": ts,
+                                "end_ts": ts + INTERVAL_SEC,
+                                "question": m.get("question", ""),
                             }))
                 if candidates:
                     candidates.sort(key=lambda x: x[0])
-                    ts, m = candidates[0]
-                    print(f"[find_next] ✅ Found via scan: slot_ts={ts} {m['question'][:80]}")
-                    return m
+                    return candidates[0][1]
         except Exception as e:
             print(f"[find_next] Scan error: {e}")
-
-        print(f"[find_next] ❌ No next window market found.")
         return None
 
-    # ── Order operations ──────────────────────────────────────────────────────
-
     def is_accepting_orders(self, token_id: str) -> bool:
-        """
-        Check if a token is currently accepting orders via the CLOB price endpoint.
-        Pre-market windows that aren't open yet will return 404 / no price.
-        If we can fetch a price, the orderbook is live and orders are accepted.
-        """
         try:
             price = self.clob.get_price(token_id, side="BUY")
-            if isinstance(price, dict):
-                p = float(price.get("price") or price.get("value") or 0)
-            else:
-                p = float(price)
+            p = float(price.get("price") if isinstance(price, dict) else price)
             return p > 0
-        except Exception:
+        except:
             return False
 
-    def place_limit_buy(self, token_id: str, price: float, amount_usd: float,
-                        label: str) -> Optional[str]:
-        """
-        GTC limit BUY order.
-        size (shares) = amount_usd / price
-        Returns order_id or None.
-        """
-        size = round(amount_usd / price, 2)
+    def place_limit_buy(self, token_id: str, price: float, amount_usd: float, label: str) -> Optional[str]:
+        # Enforce minimum 5 shares
+        min_shares = 5.0
+        min_usd = min_shares * price
+        effective_usd = max(amount_usd, min_usd + 0.05)
+        size = round(effective_usd / price, 2)
+
+        if effective_usd > amount_usd:
+            print(f"[MIN SIZE] {label} raised to ${effective_usd:.2f} ({size} shares)")
+
         if DRY_RUN:
             oid = f"DRY-BUY-{label}-{int(time.time())}"
-            print(f"[DRY RUN] LIMIT BUY {label} | price={price} size={size} (${amount_usd}) → {oid}")
+            print(f"[DRY RUN] BUY {label} | price={price} size={size} (${effective_usd}) → {oid}")
             return oid
+
         try:
-            order  = OrderArgs(token_id=token_id, price=price, size=size, side=BUY)
+            order = OrderArgs(token_id=token_id, price=price, size=size, side=BUY)
             signed = self.clob.create_order(order)
-            resp   = self.clob.post_order(signed, OrderType.GTC)
-            oid    = (resp.get("orderID") or resp.get("order_id")) if isinstance(resp, dict) else None
-            print(f"[ORDER] LIMIT BUY {label} | price={price} size={size} (${amount_usd}) → {oid}")
+            resp = self.clob.post_order(signed, OrderType.GTC)
+            oid = resp.get("orderID") or resp.get("order_id") if isinstance(resp, dict) else None
+            print(f"[ORDER] BUY {label} | price={price} size={size} → {oid}")
             return oid
         except Exception as e:
-            print(f"[ORDER FAILED] LIMIT BUY {label}: {e}")
+            print(f"[ORDER FAILED] BUY {label}: {e}")
             return None
 
-    def place_limit_sell(self, token_id: str, price: float, size: float,
-                         label: str) -> Optional[str]:
-        """GTC limit SELL order for take profit. Returns order_id or None."""
+    def place_limit_sell(self, token_id: str, price: float, size: float, label: str) -> Optional[str]:
         if DRY_RUN:
             oid = f"DRY-SELL-{label}-{int(time.time())}"
-            print(f"[DRY RUN] LIMIT SELL {label} | price={price} size={size} → {oid}")
+            print(f"[DRY RUN] SELL {label} | price={price} size={size} → {oid}")
             return oid
+
         try:
-            order  = OrderArgs(token_id=token_id, price=price, size=size, side=SELL)
+            order = OrderArgs(token_id=token_id, price=price, size=size, side=SELL)
             signed = self.clob.create_order(order)
-            resp   = self.clob.post_order(signed, OrderType.GTC)
-            oid    = (resp.get("orderID") or resp.get("order_id")) if isinstance(resp, dict) else None
-            print(f"[TP ORDER] LIMIT SELL {label} | price={price} size={size} → {oid}")
+            resp = self.clob.post_order(signed, OrderType.GTC)
+            oid = resp.get("orderID") or resp.get("order_id") if isinstance(resp, dict) else None
+            print(f"[TP] SELL {label} | price={price} size={size} → {oid}")
             return oid
         except Exception as e:
             print(f"[TP FAILED] {label}: {e}")
             return None
 
     def cancel_order(self, order_id: str, label: str):
-        """Cancel an open order by ID."""
         if DRY_RUN:
-            print(f"[DRY RUN] CANCEL {label} | order_id={order_id}")
+            print(f"[DRY RUN] CANCEL {label} | {order_id}")
             return
         try:
-            resp = self.clob.cancel(order_id=order_id)
-            print(f"[CANCEL] {label} | order_id={order_id} → {resp}")
+            self.clob.cancel(order_id=order_id)
+            print(f"[CANCEL] {label} | {order_id}")
         except Exception as e:
-            print(f"[CANCEL FAILED] {label} | order_id={order_id}: {e}")
+            print(f"[CANCEL FAILED] {label}: {e}")
 
     def get_filled_size(self, order_id: str) -> float:
-        """Return filled share quantity for an order (0.0 if unfilled or error)."""
         if DRY_RUN:
-            return 0.0   # DRY_RUN: simulate no fill unless overridden
+            return 0.0
         try:
             status = self.clob.get_order(order_id)
             if not status:
                 return 0.0
-            raw = (status.get("size_matched") or status.get("sizeFilled")
-                   or status.get("filled") or "0")
+            raw = status.get("size_matched") or status.get("sizeFilled") or status.get("filled") or "0"
             return float(raw)
-        except Exception as e:
-            print(f"[FILL CHECK] Error for {order_id}: {e}")
+        except:
             return 0.0
 
+    def get_previous_candle_color(self) -> str:
+        """GREEN / RED / NEUTRAL from previous closed 5m BTC candle"""
+        try:
+            r = requests.get(
+                "https://api.binance.com/api/v3/klines",
+                params={"symbol": "BTCUSDT", "interval": "5m", "limit": 2},
+                timeout=5
+            )
+            if r.status_code == 200:
+                data = r.json()
+                if len(data) >= 2:
+                    prev = data[-2]  # previous closed candle
+                    o = float(prev[1])
+                    c = float(prev[4])
+                    return "GREEN" if c > o else "RED" if c < o else "NEUTRAL"
+        except Exception as e:
+            print(f"[candle] Error: {e}")
+        return "NEUTRAL"
 
-# ── Pre-market order placement ────────────────────────────────────────────────
 
-async def place_premarket_orders(client: PolymarketClient) -> Optional[WindowState]:
-    """
-    Find the next window market and place limit BUY orders on both sides.
-    Waits until the market is actually accepting orders before placing.
-    Returns a WindowState tracking both order IDs, or None if it fails.
-    """
+# ── Order Placement ───────────────────────────────────────────────────────────
+
+async def place_candle_based_orders(client: PolymarketClient) -> Optional[WindowState]:
     market = client.find_next_window_market()
     if not market:
+        print("[place] ❌ No next market found")
         return None
 
-    bet     = martingale.current_bet
-    slot_ts = market["slot_ts"]
-    end_ts  = market["end_ts"]
-    dt_str  = datetime.datetime.fromtimestamp(slot_ts, tz=datetime.timezone.utc).strftime("%H:%M UTC")
+    color = client.get_previous_candle_color()
+    if color == "NEUTRAL":
+        print("[candle] ⚠️ Neutral candle — skipping")
+        return None
 
-    print(f"\n{'='*55}")
-    print(f" Pre-market orders for window {dt_str}")
-    print(f" Bet: ${bet:.2f} each side | Entry: {ENTRY_PRICE} | TP: {TAKE_PROFIT_PRICE}")
-    print(f" UP  token: {market['yes_token_id'][:28]}...")
-    print(f" DOWN token: {market['no_token_id'][:28]}...")
-    print(f"{'='*55}")
+    initial_side = "UP" if color == "GREEN" else "DOWN"
+    initial_token = market["yes_token_id"] if initial_side == "UP" else market["no_token_id"]
+    opposite_token = market["no_token_id"] if initial_side == "UP" else market["yes_token_id"]
 
-    # Wait until the market is accepting orders (orderbook is live)
-    # Pre-market windows can exist in Gamma API before CLOB accepts orders for them
-    max_wait = 120   # seconds — don't wait more than 2 minutes
-    waited   = 0
-    while not client.is_accepting_orders(market["yes_token_id"]):
-        now_ts = int(time.time())
-        if now_ts >= slot_ts:
-            # Window has started — CLOB should be accepting orders by now
-            if waited >= max_wait:
-                print(f"[premarket] ⚠️  Market still not accepting orders after {max_wait}s — placing anyway ...")
-                break
-        secs_to_open = max(slot_ts - now_ts, 0)
-        print(f"[premarket] Orderbook not live yet — {secs_to_open}s until window opens, waiting 5s ...")
+    print(f"\n{'='*80}")
+    print(f"🚀 CANDLE STRATEGY | {color} bias → {initial_side} DCA")
+    print(f"Window opens \~{datetime.datetime.fromtimestamp(market['slot_ts'], tz=datetime.timezone.utc).strftime('%H:%M UTC')}")
+    print(f"Entries: ${INITIAL_BET_PER_LEVEL} @ {ENTRY_PRICES} | Flip @ ≤{STOP_LOSS_PRICE} → ${FLIP_BET_USD} @ {FLIP_PRICE}")
+    print(f"TP @ {TAKE_PROFIT_PRICE} | DRY_RUN={DRY_RUN}")
+    print(f"{'='*80}")
+
+    # Wait for orderbook live
+    waited = 0
+    max_wait = 120
+    while not client.is_accepting_orders(initial_token):
+        if waited >= max_wait or int(time.time()) >= market["slot_ts"]:
+            print("[premarket] Orderbook not live — placing anyway")
+            break
         await asyncio.sleep(5)
         waited += 5
 
-    up_id   = client.place_limit_buy(market["yes_token_id"], ENTRY_PRICE, bet, "UP")
-    down_id = client.place_limit_buy(market["no_token_id"],  ENTRY_PRICE, bet, "DOWN")
+    # Place 3 DCA buys
+    initial_order_ids = []
+    for price in ENTRY_PRICES:
+        oid = client.place_limit_buy(initial_token, price, INITIAL_BET_PER_LEVEL, f"{initial_side}-DCA-{int(price*100)}c")
+        if oid:
+            initial_order_ids.append(oid)
 
-    if not up_id and not down_id:
-        print("[premarket] ❌ Both orders failed — skipping window.")
+    if not initial_order_ids:
         return None
 
-    state = WindowState(
-        slot_ts=slot_ts,
-        end_ts=end_ts,
-        yes_token_id=market["yes_token_id"],
-        no_token_id=market["no_token_id"],
-        bet_amount=bet,
-        up_order_id=up_id,
-        down_order_id=down_id,
+    return WindowState(
+        slot_ts=market["slot_ts"],
+        end_ts=market["end_ts"],
+        initial_side=initial_side,
+        initial_token_id=initial_token,
+        opposite_token_id=opposite_token,
+        initial_order_ids=initial_order_ids,
     )
-    print(f"[premarket] ✅ UP order={up_id} | DOWN order={down_id}")
-    return state
 
 
-# ── Window monitoring ─────────────────────────────────────────────────────────
+# ── Monitoring (Super Fast) ───────────────────────────────────────────────────
 
 async def monitor_window(client: PolymarketClient, state: WindowState):
-    """
-    Poll for fills until the window expires.
-    - First fill → cancel other side → wait 5s → place TP limit sell at 0.99
-    - Window expires with fill → check if TP filled (win) or not (loss)
-    - Window expires with no fill → no-fill (not counted as loss)
-    """
     global current_window
-
-    end_dt  = datetime.datetime.fromtimestamp(state.end_ts, tz=datetime.timezone.utc)
-    slot_dt = datetime.datetime.fromtimestamp(state.slot_ts, tz=datetime.timezone.utc)
-    print(f"\n[monitor] Watching {slot_dt.strftime('%H:%M')}–{end_dt.strftime('%H:%M UTC')} | "
-          f"UP={state.up_order_id} DOWN={state.down_order_id}")
+    print(f"[monitor] Started watching {state.initial_side} bias window | poll={POLL_INTERVAL_SEC}s")
 
     while True:
         now = int(time.time())
 
-        # ── Window expired ────────────────────────────────────────────────────
         if now >= state.end_ts:
-            if state.filled_side is None:
-                # No fill on either side
-                print(f"[monitor] ⏰ Window closed — no fills. Cancelling any remaining orders.")
-                if state.up_order_id:
-                    client.cancel_order(state.up_order_id, "UP-expired")
-                if state.down_order_id:
-                    client.cancel_order(state.down_order_id, "DOWN-expired")
-                martingale.record_no_fill()
-            else:
-                # We had a fill + TP was placed — check if TP filled (win) or not (loss)
-                tp_filled = client.get_filled_size(state.tp_order_id) if state.tp_order_id else 0.0
-                if tp_filled > 0:
-                    print(f"[monitor] ✅ WIN — TP filled {tp_filled} shares before window closed")
-                    martingale.record_win()
-                else:
-                    print(f"[monitor] ❌ LOSS — window closed, TP unfilled (position expired worthless)")
-                    if state.tp_order_id:
-                        client.cancel_order(state.tp_order_id, "TP-cleanup")
-                    martingale.record_loss()
-
-            print(f"[monitor] Next bet: ${martingale.current_bet:.2f} | "
-                  f"Consecutive losses: {martingale.consecutive_losses}")
+            print("[monitor] ⏰ Window closed — cleaning up")
+            for oid in state.initial_order_ids:
+                client.cancel_order(oid, "expired")
+            if state.flip_order_id:
+                client.cancel_order(state.flip_order_id, "expired-flip")
             state.resolved = True
             current_window = None
             return
 
-        # ── Check for fills ───────────────────────────────────────────────────
-        if state.filled_side is None:
-            up_filled   = client.get_filled_size(state.up_order_id)   if state.up_order_id   else 0.0
-            down_filled = client.get_filled_size(state.down_order_id) if state.down_order_id else 0.0
+        # === Fast Stop-Loss Flip Check ===
+        if not state.flipped:
+            try:
+                price_data = client.clob.get_price(state.initial_token_id, side="BUY")
+                current_price = float(price_data.get("price") if isinstance(price_data, dict) else price_data)
+                if current_price <= STOP_LOSS_PRICE:
+                    print(f"🔴 SL HIT @ {current_price:.2f} — FLIPPING!")
+                    for oid in state.initial_order_ids:
+                        client.cancel_order(oid, f"{state.initial_side}-SL")
+                    flip_side_label = "DOWN" if state.initial_side == "UP" else "UP"
+                    state.flip_order_id = client.place_limit_buy(
+                        state.opposite_token_id, FLIP_PRICE, FLIP_BET_USD, f"FLIP-{flip_side_label}"
+                    )
+                    state.flipped = True
+            except:
+                pass  # price fetch can fail occasionally
 
-            filled_side   = None
-            filled_shares = 0.0
-            cancel_id     = None
+        # === Fill Check + Instant TP @ 0.99 ===
+        # Initial side
+        filled_initial = sum(client.get_filled_size(oid) for oid in state.initial_order_ids)
+        if filled_initial > 0.01 and state.initial_token_id not in state.tp_orders:
+            tp_size = round(filled_initial, 2)
+            tp_id = client.place_limit_sell(state.initial_token_id, TAKE_PROFIT_PRICE, tp_size, f"TP-{state.initial_side}")
+            if tp_id:
+                state.tp_orders[state.initial_token_id] = tp_id
 
-            if up_filled > 0 and down_filled > 0:
-                # Edge case: both filled — keep the larger, cancel the other
-                if up_filled >= down_filled:
-                    filled_side, filled_shares = "UP", up_filled
-                    cancel_id = state.down_order_id
-                    print(f"[monitor] ⚠️  Both sides filled simultaneously — keeping UP ({up_filled:.2f} shares)")
-                else:
-                    filled_side, filled_shares = "DOWN", down_filled
-                    cancel_id = state.up_order_id
-                    print(f"[monitor] ⚠️  Both sides filled simultaneously — keeping DOWN ({down_filled:.2f} shares)")
-
-            elif up_filled > 0:
-                filled_side, filled_shares = "UP", up_filled
-                cancel_id = state.down_order_id
-                print(f"[monitor] ⬆ UP filled {up_filled:.2f} shares @ {ENTRY_PRICE}")
-
-            elif down_filled > 0:
-                filled_side, filled_shares = "DOWN", down_filled
-                cancel_id = state.up_order_id
-                print(f"[monitor] ⬇ DOWN filled {down_filled:.2f} shares @ {ENTRY_PRICE}")
-
-            if filled_side:
-                state.filled_side   = filled_side
-                state.filled_shares = filled_shares
-
-                # Cancel the unfilled side
-                if cancel_id:
-                    side_label = "DOWN" if filled_side == "UP" else "UP"
-                    print(f"[monitor] Cancelling {side_label} order (other side filled first) ...")
-                    client.cancel_order(cancel_id, f"{side_label}-cancelled")
-
-                # Wait for shares to settle before placing TP sell
-                print(f"[monitor] Waiting 5s for fill to settle ...")
-                await asyncio.sleep(5)
-
-                # Place TP limit sell
-                tp_token = state.yes_token_id if filled_side == "UP" else state.no_token_id
-                tp_id    = client.place_limit_sell(tp_token, TAKE_PROFIT_PRICE,
-                                                    filled_shares, f"{filled_side}-TP")
-                state.tp_order_id = tp_id
+        # Flip side
+        if state.flipped and state.flip_order_id:
+            filled_flip = client.get_filled_size(state.flip_order_id)
+            if filled_flip > 0.01 and state.opposite_token_id not in state.tp_orders:
+                tp_size = round(filled_flip, 2)
+                tp_id = client.place_limit_sell(state.opposite_token_id, TAKE_PROFIT_PRICE, tp_size, "TP-FLIP")
+                if tp_id:
+                    state.tp_orders[state.opposite_token_id] = tp_id
 
         await asyncio.sleep(POLL_INTERVAL_SEC)
 
 
-# ── Main loop ─────────────────────────────────────────────────────────────────
+# ── Main Loop ─────────────────────────────────────────────────────────────────
 
-async def run_async():
+current_window: Optional[WindowState] = None
+client = PolymarketClient()
+
+async def main():
     global current_window
-
-    print("=" * 55)
-    print(" Polymarket BTC 5m Pre-Market Dual Limit Bot")
-    print(f" DRY_RUN={DRY_RUN}")
-    print(f" Base bet : ${BASE_BET_USD}")
-    print(f" Entry    : {ENTRY_PRICE}  (both UP and DOWN)")
-    print(f" Take profit: {TAKE_PROFIT_PRICE}")
-    print(f" Poll     : every {POLL_INTERVAL_SEC}s")
-    print("=" * 55 + "\n")
-
-    client = PolymarketClient()
+    print("🤖 Candle-based 5m BTC Bot started (no martingale)")
 
     while True:
         try:
-            # If we already have an active window being monitored, keep going
-            if current_window is not None and not current_window.resolved:
+            if current_window is None or current_window.resolved:
+                current_window = await place_candle_based_orders(client)
+
+            if current_window and not current_window.resolved:
                 await monitor_window(client, current_window)
-                continue
 
-            now              = int(time.time())
-            current_ts       = (now // INTERVAL_SEC) * INTERVAL_SEC
-            secs_into_window = now - current_ts
-            secs_to_next     = INTERVAL_SEC - secs_into_window
-            cur_dt  = datetime.datetime.fromtimestamp(current_ts, tz=datetime.timezone.utc)
-
-            print(f"[loop {time.strftime('%H:%M:%S')}] "
-                  f"Window: {cur_dt.strftime('%H:%M UTC')} "
-                  f"| {secs_into_window}s in, {secs_to_next}s to next "
-                  f"| next bet=${martingale.current_bet:.2f}")
-
-            # Place pre-market orders for the next window
-            state = await place_premarket_orders(client)
-            if state:
-                current_window = state
-                await monitor_window(client, current_window)
-            else:
-                print("[loop] Could not place orders — retrying in 15s ...")
-                await asyncio.sleep(15)
-
+            await asyncio.sleep(5)  # small delay between cycles
         except Exception as e:
-            print(f"[CRITICAL ERROR] {e}")
-            traceback.print_exc()
-            await asyncio.sleep(15)
-
-
-def run():
-    asyncio.run(run_async())
+            print(f"[main] Error: {e}")
+            await asyncio.sleep(10)
 
 
 if __name__ == "__main__":
-    run()
+    asyncio.run(main())
