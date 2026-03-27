@@ -471,4 +471,93 @@ async def monitor_window(client: PolymarketClient, state: WindowState):
                 else:
                     filled_side, filled_shares = "DOWN", down_filled
                     cancel_id = state.up_order_id
-                    print(f"[monitor] ⚠️  Both sides filled simultaneously — ke
+                    print(f"[monitor] ⚠️  Both sides filled simultaneously — keeping DOWN ({down_filled:.2f} shares)")
+
+            elif up_filled > 0:
+                filled_side, filled_shares = "UP", up_filled
+                cancel_id = state.down_order_id
+                print(f"[monitor] ⬆ UP filled {up_filled:.2f} shares @ {ENTRY_PRICE}")
+
+            elif down_filled > 0:
+                filled_side, filled_shares = "DOWN", down_filled
+                cancel_id = state.up_order_id
+                print(f"[monitor] ⬇ DOWN filled {down_filled:.2f} shares @ {ENTRY_PRICE}")
+
+            if filled_side:
+                state.filled_side   = filled_side
+                state.filled_shares = filled_shares
+
+                # Cancel the unfilled side
+                if cancel_id:
+                    side_label = "DOWN" if filled_side == "UP" else "UP"
+                    print(f"[monitor] Cancelling {side_label} order (other side filled first) ...")
+                    client.cancel_order(cancel_id, f"{side_label}-cancelled")
+
+                # Wait for shares to settle before placing TP sell
+                print(f"[monitor] Waiting 5s for fill to settle ...")
+                await asyncio.sleep(5)
+
+                # Place TP limit sell
+                tp_token = state.yes_token_id if filled_side == "UP" else state.no_token_id
+                tp_id    = client.place_limit_sell(tp_token, TAKE_PROFIT_PRICE,
+                                                    filled_shares, f"{filled_side}-TP")
+                state.tp_order_id = tp_id
+
+        await asyncio.sleep(POLL_INTERVAL_SEC)
+
+
+# ── Main loop ─────────────────────────────────────────────────────────────────
+
+async def run_async():
+    global current_window
+
+    print("=" * 55)
+    print(" Polymarket BTC 5m Pre-Market Dual Limit Bot")
+    print(f" DRY_RUN={DRY_RUN}")
+    print(f" Base bet : ${BASE_BET_USD}")
+    print(f" Entry    : {ENTRY_PRICE}  (both UP and DOWN)")
+    print(f" Take profit: {TAKE_PROFIT_PRICE}")
+    print(f" Poll     : every {POLL_INTERVAL_SEC}s")
+    print("=" * 55 + "\n")
+
+    client = PolymarketClient()
+
+    while True:
+        try:
+            # If we already have an active window being monitored, keep going
+            if current_window is not None and not current_window.resolved:
+                await monitor_window(client, current_window)
+                continue
+
+            now              = int(time.time())
+            current_ts       = (now // INTERVAL_SEC) * INTERVAL_SEC
+            secs_into_window = now - current_ts
+            secs_to_next     = INTERVAL_SEC - secs_into_window
+            cur_dt  = datetime.datetime.fromtimestamp(current_ts, tz=datetime.timezone.utc)
+
+            print(f"[loop {time.strftime('%H:%M:%S')}] "
+                  f"Window: {cur_dt.strftime('%H:%M UTC')} "
+                  f"| {secs_into_window}s in, {secs_to_next}s to next "
+                  f"| next bet=${martingale.current_bet:.2f}")
+
+            # Place pre-market orders for the next window
+            state = await place_premarket_orders(client)
+            if state:
+                current_window = state
+                await monitor_window(client, current_window)
+            else:
+                print("[loop] Could not place orders — retrying in 15s ...")
+                await asyncio.sleep(15)
+
+        except Exception as e:
+            print(f"[CRITICAL ERROR] {e}")
+            traceback.print_exc()
+            await asyncio.sleep(15)
+
+
+def run():
+    asyncio.run(run_async())
+
+
+if __name__ == "__main__":
+    run()
