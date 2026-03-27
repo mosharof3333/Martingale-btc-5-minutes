@@ -74,19 +74,19 @@ class BotStats:
         if not SHOW_DASHBOARD:
             return
         win_rate = (self.wins / self.total_windows * 100) if self.total_windows > 0 else 0.0
-        print("\n" + "="*85)
+        print("\n" + "="*88)
         print("📊 CANDLE BOT SUMMARY DASHBOARD")
-        print("="*85)
+        print("="*88)
         print(f"Windows : {self.total_windows:3d} | Wins: {self.wins:3d} | Losses: {self.losses:3d} | NoFill: {self.no_fills:2d}")
-        print(f"Flips   : {self.flips:3d} | Win Rate: {win_rate:5.1f}% | Est P&L: ${self.total_profit_usd:7.2f}")
+        print(f"Flips   : {self.flips:3d} | Win Rate: {win_rate:5.1f}% | Est. P&L: ${self.total_profit_usd:7.2f}")
         print(f"Streak  : {self.current_streak:3d} (max {self.max_streak}) | Last: {self.last_result or 'N/A'}")
         print(f"TP: {TAKE_PROFIT_PRICE} | DRY_RUN: {DRY_RUN}")
-        print("="*85 + "\n")
+        print("="*88 + "\n")
 
 
 stats = BotStats()
 
-# ── State ─────────────────────────────────────────────────────────────────────
+# ── Window State ──────────────────────────────────────────────────────────────
 @dataclass
 class WindowState:
     slot_ts: int
@@ -102,7 +102,7 @@ class WindowState:
     filled_amount: float = 0.0
 
 
-# ── Client ────────────────────────────────────────────────────────────────────
+# ── Polymarket Client ─────────────────────────────────────────────────────────
 class PolymarketClient:
     def __init__(self):
         pk = os.getenv("PRIVATE_KEY")
@@ -156,20 +156,27 @@ class PolymarketClient:
                             "end_ts": slot_ts + INTERVAL_SEC,
                         }
         except Exception as e:
-            print(f"[fetch_market] Error: {e}")
+            print(f"[fetch_market] Error for slot {slot_ts}: {e}")
         return None
 
     def find_next_window_market(self):
+        """Aggressive: find the soonest ready or just-opened window (no skipping)."""
         now = int(time.time())
-        current_ts = (now // INTERVAL_SEC) * INTERVAL_SEC
-        next_ts = current_ts + INTERVAL_SEC
-        for ts in [next_ts, next_ts + INTERVAL_SEC]:
+        current_slot = (now // INTERVAL_SEC) * INTERVAL_SEC
+
+        for offset in range(0, 5):  # Check current + next 4 slots
+            ts = current_slot + offset * INTERVAL_SEC
             m = self.fetch_market_for_slot(ts)
             if m:
+                dt_str = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc).strftime("%H:%M:%S UTC")
+                status = "JUST OPENED" if current_slot <= ts <= now + INTERVAL_SEC else "NEXT"
+                print(f"[find_next] ✅ Found {status} window: slot_ts={ts} ({dt_str})")
                 return m
-        # fallback scan
+
+        # Fallback aggressive scan
+        print("[find_next] Direct lookup missed — scanning active events...")
         try:
-            r = requests.get(f"{GAMMA_API}/events", params={"active": "true", "closed": "false", "limit": 50}, timeout=15)
+            r = requests.get(f"{GAMMA_API}/events", params={"active": "true", "closed": "false", "limit": 100}, timeout=12)
             if r.status_code == 200:
                 candidates = []
                 for event in r.json():
@@ -180,7 +187,7 @@ class PolymarketClient:
                         ts = int(slug.rsplit("-", 1)[-1])
                     except:
                         continue
-                    if ts <= now:
+                    if ts + INTERVAL_SEC < now:  # fully past
                         continue
                     for m in event.get("markets", []):
                         yes_t, no_t = self._parse_token_ids(m)
@@ -193,9 +200,14 @@ class PolymarketClient:
                             }))
                 if candidates:
                     candidates.sort(key=lambda x: x[0])
-                    return candidates[0][1]
+                    ts, m = candidates[0]
+                    dt_str = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc).strftime("%H:%M:%S UTC")
+                    print(f"[find_next] ✅ Found via scan: slot_ts={ts} ({dt_str})")
+                    return m
         except Exception as e:
             print(f"[find_next] Scan error: {e}")
+
+        print("[find_next] ❌ No window ready yet")
         return None
 
     def is_accepting_orders(self, token_id: str) -> bool:
@@ -214,7 +226,7 @@ class PolymarketClient:
 
         if DRY_RUN:
             oid = f"DRY-BUY-{label}-{int(time.time())}"
-            print(f"[DRY] BUY {label} @ {price} (${effective_usd}) → {oid}")
+            print(f"[DRY] BUY {label} @ {price} (${effective_usd:.2f}) → {oid}")
             return oid
 
         try:
@@ -230,9 +242,8 @@ class PolymarketClient:
 
     def place_limit_sell(self, token_id: str, price: float, size: float, label: str) -> Optional[str]:
         if DRY_RUN:
-            oid = f"DRY-SELL-{label}-{int(time.time())}"
             print(f"[DRY] SELL {label} @ {price} size={size}")
-            return oid
+            return f"DRY-SELL-{label}"
         try:
             order = OrderArgs(token_id=token_id, price=price, size=size, side=SELL)
             signed = self.clob.create_order(order)
@@ -266,8 +277,11 @@ class PolymarketClient:
 
     def get_previous_candle_color(self) -> str:
         try:
-            r = requests.get("https://api.binance.com/api/v3/klines",
-                             params={"symbol": "BTCUSDT", "interval": "5m", "limit": 2}, timeout=5)
+            r = requests.get(
+                "https://api.binance.com/api/v3/klines",
+                params={"symbol": "BTCUSDT", "interval": "5m", "limit": 2},
+                timeout=5
+            )
             if r.status_code == 200:
                 data = r.json()
                 if len(data) >= 2:
@@ -280,31 +294,36 @@ class PolymarketClient:
         return "NEUTRAL"
 
 
-# ── Placement ─────────────────────────────────────────────────────────────────
+# ── Placement (Fast start on window open) ─────────────────────────────────────
 async def place_candle_based_orders(client: PolymarketClient) -> Optional[WindowState]:
     market = client.find_next_window_market()
     if not market:
-        print("[place] No next market found")
         return None
 
     color = client.get_previous_candle_color()
     if color == "NEUTRAL":
-        print("[candle] Neutral — skipping")
+        print("[candle] Neutral candle — skipping")
         return None
 
     initial_side = "UP" if color == "GREEN" else "DOWN"
     initial_token = market["yes_token_id"] if initial_side == "UP" else market["no_token_id"]
     opposite_token = market["no_token_id"] if initial_side == "UP" else market["yes_token_id"]
 
-    print(f"\n{'='*80}")
-    print(f"🚀 {color} bias → Starting {initial_side} DCA")
-    print(f"{'='*80}")
+    print(f"\n{'='*85}")
+    print(f"🚀 {color} bias → Placing {initial_side} DCA orders as soon as window opens")
+    print(f"Entries: ${INITIAL_BET_PER_LEVEL} @ {ENTRY_PRICES} | SL flip @ {STOP_LOSS_PRICE} → ${FLIP_BET_USD} @ {FLIP_PRICE}")
+    print(f"{'='*85}")
 
-    waited = 0
-    while not client.is_accepting_orders(initial_token) and waited < 120:
-        await asyncio.sleep(5)
-        waited += 5
+    # Fast retry until orderbook is live
+    for attempt in range(40):  # max \~40 seconds
+        if client.is_accepting_orders(initial_token):
+            print(f"[premarket] ✅ Orderbook live — placing DCA orders now")
+            break
+        if attempt % 8 == 0 and attempt > 0:
+            print(f"[premarket] Orderbook not live yet (attempt {attempt+1})")
+        await asyncio.sleep(1)
 
+    # Place the 3 DCA limit buys immediately
     initial_order_ids = []
     for price in ENTRY_PRICES:
         oid = client.place_limit_buy(initial_token, price, INITIAL_BET_PER_LEVEL, f"{initial_side}-DCA-{int(price*100)}c")
@@ -312,6 +331,7 @@ async def place_candle_based_orders(client: PolymarketClient) -> Optional[Window
             initial_order_ids.append(oid)
 
     if not initial_order_ids:
+        print("[premarket] ❌ Failed to place orders")
         return None
 
     return WindowState(
@@ -327,12 +347,12 @@ async def place_candle_based_orders(client: PolymarketClient) -> Optional[Window
 # ── Monitoring ────────────────────────────────────────────────────────────────
 async def monitor_window(client: PolymarketClient, state: WindowState):
     global current_window
-    print(f"[monitor] Watching {state.initial_side} window | poll {POLL_INTERVAL_SEC}s")
+    print(f"[monitor] Watching {state.initial_side} bias window | poll={POLL_INTERVAL_SEC}s")
 
     while True:
         now = int(time.time())
         if now >= state.end_ts:
-            print("[monitor] Window closed")
+            print("[monitor] ⏰ Window closed")
             for oid in state.initial_order_ids:
                 client.cancel_order(oid, "expired")
             if state.flip_order_id:
@@ -344,7 +364,7 @@ async def monitor_window(client: PolymarketClient, state: WindowState):
 
             no_fill = filled < 0.01
             is_win = not no_fill
-            profit = filled * (TAKE_PROFIT_PRICE - 0.35) if not no_fill else 0.0   # rough estimate
+            profit = filled * (TAKE_PROFIT_PRICE - 0.35) if not no_fill else 0.0
 
             stats.record_result(is_win=is_win, profit=profit, flipped=state.flipped, no_fill=no_fill)
             stats.print_dashboard()
@@ -353,22 +373,24 @@ async def monitor_window(client: PolymarketClient, state: WindowState):
             current_window = None
             return
 
-        # Fast flip check
+        # Fast SL flip check
         if not state.flipped:
             try:
                 price_data = client.clob.get_price(state.initial_token_id, side="BUY")
                 curr_price = float(price_data.get("price") if isinstance(price_data, dict) else price_data)
                 if curr_price <= STOP_LOSS_PRICE:
-                    print(f"🔴 SL HIT @ {curr_price:.2f} → FLIPPING!")
+                    print(f"🔴 SL HIT @ {curr_price:.2f} — FLIPPING!")
                     for oid in state.initial_order_ids:
                         client.cancel_order(oid, f"{state.initial_side}-SL")
                     flip_label = "DOWN" if state.initial_side == "UP" else "UP"
-                    state.flip_order_id = client.place_limit_buy(state.opposite_token_id, FLIP_PRICE, FLIP_BET_USD, f"FLIP-{flip_label}")
+                    state.flip_order_id = client.place_limit_buy(
+                        state.opposite_token_id, FLIP_PRICE, FLIP_BET_USD, f"FLIP-{flip_label}"
+                    )
                     state.flipped = True
             except:
                 pass
 
-        # TP on fills
+        # Place TP on any fill
         filled_initial = sum(client.get_filled_size(oid) for oid in state.initial_order_ids)
         if filled_initial > 0.01 and state.initial_token_id not in state.tp_orders:
             tp_id = client.place_limit_sell(state.initial_token_id, TAKE_PROFIT_PRICE, round(filled_initial, 2), f"TP-{state.initial_side}")
@@ -385,13 +407,13 @@ async def monitor_window(client: PolymarketClient, state: WindowState):
         await asyncio.sleep(POLL_INTERVAL_SEC)
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Main Loop ─────────────────────────────────────────────────────────────────
 current_window: Optional[WindowState] = None
 client = PolymarketClient()
 
 async def main():
     global current_window
-    print("🤖 Candle 5m BTC Bot + Dashboard started\n")
+    print("🤖 Candle 5m BTC Bot (Fast Entry + Dashboard) started\n")
     stats.print_dashboard()
 
     while True:
@@ -402,7 +424,7 @@ async def main():
             if current_window and not current_window.resolved:
                 await monitor_window(client, current_window)
 
-            await asyncio.sleep(5)
+            await asyncio.sleep(3)   # fast cycle when idle
         except Exception as e:
             print(f"[main loop] Error: {e}")
             await asyncio.sleep(10)
